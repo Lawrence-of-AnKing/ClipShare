@@ -996,6 +996,68 @@ void main() {
         'PUT /clipshare/retry-fails/parent/file.txt',
       ]);
     });
+
+    group('uploadFile', () {
+      late Directory tempDir;
+      late File localFile;
+
+      setUp(() async {
+        tempDir = await Directory.systemTemp.createTemp('clipshare_webdav_upload_');
+        localFile = File('${tempDir.path}${Platform.pathSeparator}image.png');
+        await localFile.writeAsBytes(utf8.encode('upload'));
+      });
+
+      tearDown(() async {
+        await tempDir.delete(recursive: true);
+      });
+
+      test('direct upload succeeds without directory fallback', () async {
+        const path = '/upload-direct/image.png';
+        await webDavServer.createDirectory('/clipshare/upload-direct');
+
+        expect(await client.uploadFile(path, localFile.path), isTrue);
+
+        expect(webDavServer.requests, <String>['PUT /clipshare/upload-direct/image.png']);
+      });
+
+      test('missing parent (409) cascades directories before retrying upload', () async {
+        const path = '/upload-fallback/files/image.png';
+        webDavServer.failPutOnce('/clipshare$path');
+
+        expect(await client.uploadFile(path, localFile.path), isTrue);
+
+        expect(webDavServer.requests, <String>[
+          'PUT /clipshare/upload-fallback/files/image.png',
+          'MKCOL /clipshare/upload-fallback/files',
+          'PROPFIND /clipshare/upload-fallback/files',
+          'MKCOL /clipshare/upload-fallback',
+          'MKCOL /clipshare/upload-fallback/files',
+          'PUT /clipshare/upload-fallback/files/image.png',
+        ]);
+        expect(utf8.decode(await webDavServer.readBytes('/clipshare$path')), 'upload');
+      });
+
+      test('returns false when directory fallback succeeds but upload retry fails', () async {
+        const path = '/upload-retry-fails/files/image.png';
+        webDavServer.failPut('/clipshare$path');
+
+        expect(await client.uploadFile(path, localFile.path), isFalse);
+
+        expect(
+          webDavServer.requests.where((request) => request.startsWith('PUT ')),
+          hasLength(2),
+        );
+      });
+
+      test('returns false without upload when local file is missing', () async {
+        expect(
+          await client.uploadFile('/upload-missing/image.png', '${tempDir.path}/missing.png'),
+          isFalse,
+        );
+
+        expect(webDavServer.requests, isEmpty);
+      });
+    });
   });
 }
 
@@ -1623,6 +1685,15 @@ class _TestWebDavServer {
     final normalizedPath = _normalize(path);
     _ensureParentDirectories(normalizedPath);
     _entries[normalizedPath] = _StoredEntry.file(List<int>.from(bytes));
+  }
+
+  /// 读取已写入的文件内容，便于断言上传结果。
+  Future<List<int>> readBytes(String path) async {
+    final entry = _entries[_normalize(path)];
+    if (entry == null || entry.isDirectory) {
+      throw StateError('file not found: $path');
+    }
+    return entry.bytes;
   }
 
   Future<void> _handleRequest(HttpRequest request) async {

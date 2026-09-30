@@ -372,6 +372,8 @@ class WebDAVClient extends StorageClient {
     );
   }
 
+  /// 先直接上传文件，若服务端因父目录缺失拒绝写入（409/404），
+  /// 则级联创建父目录并重试一次，与 [createFile] 的 createDir 回退保持一致。
   @override
   Future<bool> uploadFile(
     String path,
@@ -379,15 +381,14 @@ class WebDAVClient extends StorageClient {
     StorageProgressFunc? onProgress,
   }) async {
     path = path.unixPath;
+    final File file;
+    final String filePath;
     try {
-      final file = File(localFilePath);
+      file = File(localFilePath);
       if (!await file.exists()) {
         return false;
       }
-      final filePath = _toClientPath(path, isDirectory: false);
-      StorageClient.recordClientInvoke('uploadFile', path: path);
-      await _client.putFileStream(filePath, file, onProgress: onProgress);
-      return true;
+      filePath = _toClientPath(path, isDirectory: false);
     } catch (err, stack) {
       _logStorageError('uploadFile', err, stack, <String, Object?>{
         'path': path,
@@ -395,6 +396,59 @@ class WebDAVClient extends StorageClient {
       });
       return false;
     }
+    try {
+      await _uploadFileRequest(path, filePath, file, onProgress);
+      return true;
+    } catch (err, stack) {
+      if (!_isMissingParentError(err)) {
+        _logStorageError('uploadFile', err, stack, <String, Object?>{
+          'path': path,
+          'localFilePath': localFilePath,
+        });
+        return false;
+      }
+      final dir = (path.split(Constants.unixDirSeparate)..removeLast()).join(Constants.unixDirSeparate);
+      if (!await createDirectory(dir)) {
+        _logStorageError('uploadFile', err, stack, <String, Object?>{
+          'path': path,
+          'localFilePath': localFilePath,
+          'fallback': 'createDirectory failed',
+        });
+        return false;
+      }
+      try {
+        await _uploadFileRequest(path, filePath, file, onProgress);
+        return true;
+      } catch (retryErr, retryStack) {
+        _logStorageError('uploadFile', retryErr, retryStack, <String, Object?>{
+          'path': path,
+          'localFilePath': localFilePath,
+          'firstError': err,
+        });
+        return false;
+      }
+    }
+  }
+
+  /// 直接向 WebDAV 服务端发送一次流式文件上传请求。
+  Future<void> _uploadFileRequest(
+    String path,
+    String filePath,
+    File file,
+    StorageProgressFunc? onProgress,
+  ) async {
+    StorageClient.recordClientInvoke('uploadFile', path: path);
+    await _client.putFileStream(filePath, file, onProgress: onProgress);
+  }
+
+  /// RFC 4918 规定父集合不存在时 PUT 返回 409，部分服务端返回 404。
+  /// 仅对这两类错误级联建目录，避免网络错误或取消时重复上传大文件。
+  bool _isMissingParentError(Object err) {
+    if (err is! WebDAVException) {
+      return false;
+    }
+    final statusCode = err.statusCode;
+    return statusCode == HttpStatus.conflict || statusCode == HttpStatus.notFound;
   }
 
   @override

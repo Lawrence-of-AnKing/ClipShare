@@ -1,0 +1,69 @@
+name: fork-fix-ci
+
+# Fork-only workflow: run the full test suite on the upstream base and on this branch,
+# then build Windows and Android packages with the upstream build workflows.
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - fix/webdav-upload-create-parent-dir
+  workflow_dispatch:
+
+env:
+  UPSTREAM_BASE: 337e2afcb69cba40b45aeb3746dbd6e529caf111
+
+jobs:
+  test:
+    name: test (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [base, head]
+    # The upstream base may already contain failing tests; it only provides the baseline.
+    continue-on-error: ${{ matrix.target == 'base' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Switch to upstream base
+        if: matrix.target == 'base'
+        run: git checkout "$UPSTREAM_BASE"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.41.9
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Run all tests
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter test --reporter expanded 2>&1 | tee test-output.txt
+
+      - name: Summarize
+        if: always()
+        shell: bash
+        run: |
+          echo "### ${{ matrix.target }} ($(git rev-parse --short HEAD))" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 3 test-output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  build-windows:
+    needs: test
+    uses: ./.github/workflows/build-windows.yml
+
+  build-android:
+    needs: test
+    uses: ./.github/workflows/build-android.yml
+    secrets: inherit
