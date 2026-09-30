@@ -22,13 +22,14 @@ jobs:
       fail-fast: false
       matrix:
         target: [base, head]
-    # The upstream base may already contain failing tests; it only provides the baseline.
-    continue-on-error: ${{ matrix.target == 'base' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Keep gate script from branch head
+        run: cp .github/scripts/test_results.py "$RUNNER_TEMP/test_results.py"
 
       - name: Switch to upstream base
         if: matrix.target == 'base'
@@ -44,26 +45,41 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      # Upstream already has failing tests; the gate job decides pass/fail.
       - name: Run all tests
         shell: bash
         run: |
-          set -o pipefail
-          flutter test --reporter expanded 2>&1 | tee test-output.txt
+          flutter test --reporter json > results.jsonl || true
+          python3 "$RUNNER_TEMP/test_results.py" summarize results.jsonl summary-${{ matrix.target }}.json
 
-      - name: Summarize
-        if: always()
-        shell: bash
-        run: |
-          echo "### ${{ matrix.target }} ($(git rev-parse --short HEAD))" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -n 3 test-output.txt >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload test summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-summary-${{ matrix.target }}
+          path: summary-${{ matrix.target }}.json
+
+  # Gate: head must not add failing tests vs upstream base, and passed(head) >= passed(base).
+  gate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download test summaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: test-summary-*
+          merge-multiple: true
+
+      - name: Compare against upstream base
+        run: python3 .github/scripts/test_results.py gate summary-base.json summary-head.json
 
   build-windows:
-    needs: test
+    needs: gate
     uses: ./.github/workflows/build-windows.yml
 
   build-android:
-    needs: test
+    needs: gate
     uses: ./.github/workflows/build-android.yml
     secrets: inherit
